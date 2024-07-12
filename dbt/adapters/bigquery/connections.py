@@ -17,8 +17,9 @@ import google.auth
 import google.auth.exceptions
 import google.cloud.bigquery
 import google.cloud.exceptions
-from google.api_core import retry, client_info
+from google.api_core import retry, client_info, client_options
 from google.auth import impersonated_credentials
+from google.auth.credentials import AnonymousCredentials
 from google.oauth2 import (
     credentials as GoogleCredentials,
     service_account as GoogleServiceAccountCredentials,
@@ -372,7 +373,6 @@ class BigQueryConnectionManager(BaseConnectionManager):
     @classmethod
     @retry.Retry()  # google decorator. retries on transient errors with exponential backoff
     def get_bigquery_client(cls, profile_credentials):
-        creds = cls.get_credentials(profile_credentials)
         execution_project = profile_credentials.execution_project
         location = getattr(profile_credentials, "location", None)
 
@@ -381,6 +381,8 @@ class BigQueryConnectionManager(BaseConnectionManager):
             execution_project,
             creds,
             location=location,
+            client_options = ClientOptions(api_endpoint="http://0.0.0.0:9050"),
+            credentials=AnonymousCredentials(),
             client_info=info,
         )
 
