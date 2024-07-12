@@ -1,47 +1,49 @@
-from concurrent.futures import TimeoutError
 import json
 import re
+from concurrent.futures import TimeoutError
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-
-from dbt_common.invocation import get_invocation_id
-
-from dbt_common.events.contextvars import get_node_info
-from mashumaro.helper import pass_through
-
 from functools import lru_cache
-from requests.exceptions import ConnectionError
-from typing import Optional, Any, Dict, Tuple, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple, Union
 
 import google.auth
 import google.auth.exceptions
 import google.cloud.bigquery
 import google.cloud.exceptions
-from google.api_core import retry, client_info, client_options
+from dbt_common.dataclass_schema import ExtensibleDbtClassMixin, StrEnum
+from dbt_common.events.contextvars import get_node_info
+from dbt_common.events.functions import fire_event
+from dbt_common.exceptions import (
+    DbtConfigError,
+    DbtDatabaseError,
+    DbtRuntimeError,
+)
+from dbt_common.invocation import get_invocation_id
+from google.api_core import client_info, retry
+from google.api_core.client_options import ClientOptions
 from google.auth import impersonated_credentials
 from google.auth.credentials import AnonymousCredentials
 from google.oauth2 import (
     credentials as GoogleCredentials,
+)
+from google.oauth2 import (
     service_account as GoogleServiceAccountCredentials,
 )
+from mashumaro.helper import pass_through
+from requests.exceptions import ConnectionError
 
-from dbt.adapters.bigquery import gcloud
-from dbt.adapters.contracts.connection import ConnectionState, AdapterResponse, Credentials
-from dbt_common.exceptions import (
-    DbtRuntimeError,
-    DbtConfigError,
-)
-
-from dbt_common.exceptions import DbtDatabaseError
-from dbt.adapters.exceptions.connection import FailedToConnectError
 from dbt.adapters.base import BaseConnectionManager
+from dbt.adapters.bigquery import __version__ as dbt_version
+from dbt.adapters.bigquery import gcloud
+from dbt.adapters.bigquery.utility import base64_to_string, is_base64
+from dbt.adapters.contracts.connection import (
+    AdapterResponse,
+    ConnectionState,
+    Credentials,
+)
 from dbt.adapters.events.logging import AdapterLogger
 from dbt.adapters.events.types import SQLQuery
-from dbt_common.events.functions import fire_event
-from dbt.adapters.bigquery import __version__ as dbt_version
-from dbt.adapters.bigquery.utility import is_base64, base64_to_string
-
-from dbt_common.dataclass_schema import ExtensibleDbtClassMixin, StrEnum
+from dbt.adapters.exceptions.connection import FailedToConnectError
 
 if TYPE_CHECKING:
     # Indirectly imported via agate_helper, which is lazy loaded further downfile.
@@ -80,7 +82,9 @@ def get_bigquery_defaults(scopes=None) -> Tuple[Any, Optional[str]]:
         credentials, _ = google.auth.default(scopes=scopes)
         return credentials, _
     except google.auth.exceptions.DefaultCredentialsError as e:
-        raise DbtConfigError(f"Failed to authenticate with supplied credentials\nerror:\n{e}")
+        raise DbtConfigError(
+            f"Failed to authenticate with supplied credentials\nerror:\n{e}"
+        )
 
 
 class Priority(StrEnum):
@@ -93,6 +97,7 @@ class BigQueryConnectionMethod(StrEnum):
     SERVICE_ACCOUNT = "service-account"
     SERVICE_ACCOUNT_JSON = "service-account-json"
     OAUTH_SECRETS = "oauth-secrets"
+    EMULATOR = "emulator"
 
 
 @dataclass
@@ -168,6 +173,8 @@ class BigQueryCredentials(Credentials):
         "timeout_seconds": "job_execution_timeout_seconds",
     }
 
+    endpoint: Optional[str] = None
+
     def __post_init__(self):
         if self.keyfile_json and "private_key" in self.keyfile_json:
             self.keyfile_json["private_key"] = self.keyfile_json["private_key"].replace(
@@ -238,7 +245,9 @@ class BigQueryConnectionManager(BaseConnectionManager):
         if hasattr(error, "query_job"):
             logger.error(
                 cls._bq_job_link(
-                    error.query_job.location, error.query_job.project, error.query_job.job_id
+                    error.query_job.location,
+                    error.query_job.project,
+                    error.query_job.job_id,
                 )
             )
         raise DbtDatabaseError(error_msg)
@@ -323,7 +332,9 @@ class BigQueryConnectionManager(BaseConnectionManager):
         return f"{rows_number:3.1f}{unit}".strip()
 
     @classmethod
-    def get_google_credentials(cls, profile_credentials) -> GoogleCredentials:
+    def get_google_credentials(
+        cls, profile_credentials
+    ) -> Union[GoogleCredentials.Credentials, AnonymousCredentials]:
         method = profile_credentials.method
         creds = GoogleServiceAccountCredentials.Credentials
 
@@ -333,13 +344,17 @@ class BigQueryConnectionManager(BaseConnectionManager):
 
         elif method == BigQueryConnectionMethod.SERVICE_ACCOUNT:
             keyfile = profile_credentials.keyfile
-            return creds.from_service_account_file(keyfile, scopes=profile_credentials.scopes)
+            return creds.from_service_account_file(
+                keyfile, scopes=profile_credentials.scopes
+            )
 
         elif method == BigQueryConnectionMethod.SERVICE_ACCOUNT_JSON:
             details = profile_credentials.keyfile_json
             if is_base64(profile_credentials.keyfile_json):
                 details = base64_to_string(details)
-            return creds.from_service_account_info(details, scopes=profile_credentials.scopes)
+            return creds.from_service_account_info(
+                details, scopes=profile_credentials.scopes
+            )
 
         elif method == BigQueryConnectionMethod.OAUTH_SECRETS:
             return GoogleCredentials.Credentials(
@@ -350,6 +365,9 @@ class BigQueryConnectionManager(BaseConnectionManager):
                 token_uri=profile_credentials.token_uri,
                 scopes=profile_credentials.scopes,
             )
+
+        elif method == BigQueryConnectionMethod.EMULATOR:
+            return AnonymousCredentials()
 
         error = 'Invalid `method` in profile: "{}"'.format(method)
         raise FailedToConnectError(error)
@@ -373,16 +391,17 @@ class BigQueryConnectionManager(BaseConnectionManager):
     @classmethod
     @retry.Retry()  # google decorator. retries on transient errors with exponential backoff
     def get_bigquery_client(cls, profile_credentials):
+        creds = cls.get_credentials(profile_credentials)
         execution_project = profile_credentials.execution_project
         location = getattr(profile_credentials, "location", None)
+        endpoint = getattr(profile_credentials, "endpoint", None)
 
         info = client_info.ClientInfo(user_agent=f"dbt-bigquery-{dbt_version.version}")
         return google.cloud.bigquery.Client(
             execution_project,
             creds,
+            client_options=ClientOptions(api_endpoint=endpoint),
             location=location,
-            client_options = ClientOptions(api_endpoint="http://0.0.0.0:9050"),
-            credentials=AnonymousCredentials(),
             client_info=info,
         )
 
@@ -403,7 +422,8 @@ class BigQueryConnectionManager(BaseConnectionManager):
 
         except Exception as e:
             logger.debug(
-                "Got an error when attempting to create a bigquery " "client: '{}'".format(e)
+                "Got an error when attempting to create a bigquery "
+                "client: '{}'".format(e)
             )
 
             connection.handle = None
@@ -623,7 +643,9 @@ class BigQueryConnectionManager(BaseConnectionManager):
         def standard_to_legacy(table):
             return table.project + ":" + table.dataset + "." + table.identifier
 
-        legacy_sql = "SELECT * FROM [" + standard_to_legacy(table) + "$__PARTITIONS_SUMMARY__]"
+        legacy_sql = (
+            "SELECT * FROM [" + standard_to_legacy(table) + "$__PARTITIONS_SUMMARY__]"
+        )
 
         sql = self._add_query_comment(legacy_sql)
         # auto_begin is ignored on bigquery, and only included for consistency
@@ -661,8 +683,12 @@ class BigQueryConnectionManager(BaseConnectionManager):
         )
 
         def copy_and_results():
-            job_config = google.cloud.bigquery.CopyJobConfig(write_disposition=write_disposition)
-            copy_job = client.copy_table(source_ref_array, destination_ref, job_config=job_config)
+            job_config = google.cloud.bigquery.CopyJobConfig(
+                write_disposition=write_disposition
+            )
+            copy_job = client.copy_table(
+                source_ref_array, destination_ref, job_config=job_config
+            )
             timeout = self.get_job_execution_timeout_seconds(conn) or 300
             iterator = copy_job.result(timeout=timeout)
             return copy_job, iterator
@@ -678,7 +704,9 @@ class BigQueryConnectionManager(BaseConnectionManager):
 
     @staticmethod
     def dataset_ref(database, schema):
-        return google.cloud.bigquery.DatasetReference(project=database, dataset_id=schema)
+        return google.cloud.bigquery.DatasetReference(
+            project=database, dataset_id=schema
+        )
 
     @staticmethod
     def table_ref(database, schema, table_name):
@@ -700,7 +728,9 @@ class BigQueryConnectionManager(BaseConnectionManager):
         client = conn.handle
 
         def fn():
-            return client.delete_dataset(dataset_ref, delete_contents=True, not_found_ok=True)
+            return client.delete_dataset(
+                dataset_ref, delete_contents=True, not_found_ok=True
+            )
 
         self._retry_and_handle(msg="drop dataset", conn=conn, fn=fn)
 
@@ -740,17 +770,23 @@ class BigQueryConnectionManager(BaseConnectionManager):
         """Query the client and wait for results."""
         # Cannot reuse job_config if destination is set and ddl is used
         job_config = google.cloud.bigquery.QueryJobConfig(**job_params)
-        query_job = client.query(query=sql, job_config=job_config, timeout=job_creation_timeout)
+        query_job = client.query(
+            query=sql, job_config=job_config, timeout=job_creation_timeout
+        )
         if (
             query_job.location is not None
             and query_job.job_id is not None
             and query_job.project is not None
         ):
             logger.debug(
-                self._bq_job_link(query_job.location, query_job.project, query_job.job_id)
+                self._bq_job_link(
+                    query_job.location, query_job.project, query_job.job_id
+                )
             )
         try:
-            iterator = query_job.result(max_results=limit, timeout=job_execution_timeout)
+            iterator = query_job.result(
+                max_results=limit, timeout=job_execution_timeout
+            )
             return query_job, iterator
         except TimeoutError:
             exc = f"Operation did not complete within the designated timeout of {job_execution_timeout} seconds."
